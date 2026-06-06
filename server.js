@@ -5,6 +5,49 @@ app.use(cors());
 app.use(express.json());
 
 const PORT = process.env.PORT || 10000;
+const BASE_URL = 'https://dhun-mcp-server.onrender.com';
+
+// OAuth 2.0 Authorization Server Metadata (RFC 8414)
+// Tells Claude this server uses no-auth / open access
+app.get('/.well-known/oauth-authorization-server', (req, res) => {
+    res.json({
+          issuer: BASE_URL,
+          authorization_endpoint: BASE_URL + '/oauth/authorize',
+          token_endpoint: BASE_URL + '/oauth/token',
+          response_types_supported: ['code'],
+          grant_types_supported: ['authorization_code'],
+          code_challenge_methods_supported: ['S256']
+    });
+});
+
+// OpenID Connect Discovery
+app.get('/.well-known/openid-configuration', (req, res) => {
+    res.json({
+          issuer: BASE_URL,
+          authorization_endpoint: BASE_URL + '/oauth/authorize',
+          token_endpoint: BASE_URL + '/oauth/token',
+          response_types_supported: ['code'],
+          subject_types_supported: ['public']
+    });
+});
+
+// OAuth authorize endpoint - auto-approve, redirect back with code
+app.get('/oauth/authorize', (req, res) => {
+    const { redirect_uri, state, code_challenge } = req.query;
+    const code = 'dhun-static-code-' + Date.now();
+    const url = redirect_uri + '?code=' + code + (state ? '&state=' + state : '');
+    res.redirect(url);
+});
+
+// OAuth token endpoint - return static token
+app.post('/oauth/token', (req, res) => {
+    res.json({
+          access_token: 'dhun-static-token',
+          token_type: 'Bearer',
+          expires_in: 86400,
+          scope: 'mcp'
+    });
+});
 
 const TOOLS = [
   {
@@ -44,7 +87,7 @@ const TOOLS = [
   ];
 
 app.get('/', (req, res) => {
-    res.json({ server: 'Dhun MCP Server', status: 'live', version: '2.0' });
+    res.json({ server: 'Dhun MCP Server', status: 'live', version: '3.0' });
 });
 
 app.get('/health', (req, res) => {
@@ -99,5 +142,5 @@ function handleTool(name, args) {
 }
 
 app.listen(PORT, () => {
-    console.log('Dhun MCP Server v2 running on port', PORT);
+    console.log('Dhun MCP Server v3 running on port', PORT);
 });
