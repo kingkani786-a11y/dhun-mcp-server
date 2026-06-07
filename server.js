@@ -12,7 +12,464 @@ const BASE_URL = 'https://dhun-mcp-server.onrender.com';
 
 // Dhan API credentials from environment
 const DHAN_CLIENT_ID = process.env.DHAN_CLIENT_ID || '';
-const DHAN_ACCESS_TOKEN = process.env.DHAN_ACCESS_TOKEN || '';
+const DHAN_ACCESS_TOKEN = process.env.DHAN_ACCESS_TOKEN || '';const express = require('express');
+const cors = require('cors');
+const crypto = require('crypto');
+const app = express();
+
+app.use(cors({ origin: '*' }));
+app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
+
+const PORT = process.env.PORT || 10000;
+const BASE_URL = 'https://dhun-mcp-server.onrender.com';
+
+// Global request logger
+app.use((req, res, next) => {
+    const ts = new Date().toISOString();
+    console.log('[REQ]', ts, req.method, req.path, JSON.stringify(req.query), JSON.stringify(req.body || {}).slice(0, 300));
+    res.on('finish', () => console.log('[RES]', req.method, req.path, res.statusCode));
+    next();
+});
+
+// In-memory stores
+const registeredClients = {};
+const authCodes = {};
+const accessTokens = {};
+
+// ─── NSE API helpers ──────────────────────────────────────────────────────────
+
+const NSE_HEADERS = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    'Accept': '*/*',
+    'Accept-Language': 'en-US,en;q=0.9',
+    'Accept-Encoding': 'gzip, deflate, br',
+    'Referer': 'https://www.nseindia.com/',
+    'Connection': 'keep-alive'
+};
+
+let nse_cookies = '';
+let nse_cookie_ts = 0;
+
+async function getNSECookies() {
+    const now = Date.now();
+    if (nse_cookies && (now - nse_cookie_ts) < 5 * 60 * 1000) return nse_cookies;
+    try {
+          const res = await fetch('https://www.nseindia.com/', { headers: NSE_HEADERS });
+          const setCookie = res.headers.get('set-cookie');
+          if (setCookie) {
+                  nse_cookies = setCookie.split(',').map(c => c.split(';')[0]).join('; ');
+                  nse_cookie_ts = now;
+                  console.log('[NSE] Cookies refreshed');
+          }
+    } catch (e) {
+          console.log('[NSE] Cookie fetch error:', e.message);
+    }
+    return nse_cookies;
+}
+
+async function nseGet(url) {
+    const cookies = await getNSECookies();
+    const headers = { ...NSE_HEADERS, 'Cookie': cookies };
+    const res = await fetch(url, { headers });
+    if (!res.ok) throw new Error('NSE API error: ' + res.status + ' ' + url);
+    return await res.json();
+}
+
+// Fetch NIFTY Option Chain from NSE
+async function fetchNiftyOptionChain() {
+    const data = await nseGet('https://www.nseindia.com/api/option-chain-indices?symbol=NIFTY');
+    return data;
+}
+
+// Fetch BANKNIFTY Option Chain from NSE
+async function fetchBankNiftyOptionChain() {
+    const data = await nseGet('https://www.nseindia.com/api/option-chain-indices?symbol=BANKNIFTY');
+    return data;
+}
+
+// Extract spot price and compute PCR from option chain
+function processOptionChain(data, symbol) {
+    const records = data?.records;
+    const filtered = data?.filtered;
+
+    const spot = records?.underlyingValue || 0;
+    const expiryDates = records?.expiryDates || [];
+    const nearExpiry = expiryDates[0] || '';
+
+    let totalCEOI = 0, totalPEOI = 0;
+    let maxCEOI = 0, maxPEOI = 0;
+    let maxCEStrike = 0, maxPEStrike = 0;
+    const optionData = [];
+
+    (records?.data || []).forEach(item => {
+          const strike = item.strikePrice;
+          const ce = item.CE;
+          const pe = item.PE;
+
+          if (ce) {
+                  totalCEOI += ce.openInterest || 0;
+                  if ((ce.openInterest || 0) > maxCEOI) {
+                            maxCEOI = ce.openInterest;
+                            maxCEStrike = strike;
+                  }
+          }
+          if (pe) {
+                  totalPEOI += pe.openInterest || 0;
+                  if ((pe.openInterest || 0) > maxPEOI) {
+                            maxPEOI = pe.openInterest;
+                            maxPEStrike = strike;
+                  }
+          }
+
+          if (ce || pe) {
+                  optionData.push({
+                            strike,
+                            ce_ltp: ce?.lastPrice || 0,
+                            ce_oi: ce?.openInterest || 0,
+                            ce_iv: ce?.impliedVolatility || 0,
+                            ce_chng_oi: ce?.changeinOpenInterest || 0,
+                            pe_ltp: pe?.lastPrice || 0,
+                            pe_oi: pe?.openInterest || 0,
+                            pe_iv: pe?.impliedVolatility || 0,
+                            pe_chng_oi: pe?.changeinOpenInterest || 0
+                  });
+          }
+    });
+
+    const pcr = totalCEOI > 0 ? parseFloat((totalPEOI / totalCEOI).toFixed(3)) : 0;
+
+    return {
+          symbol,
+          spot,
+          pcr,
+          totalCEOI,
+          totalPEOI,
+          maxCEStrike,
+          maxPEStrike,
+          nearExpiry,
+          expiryDates: expiryDates.slice(0, 5),
+          optionData: optionData.filter(o => o.strike >= spot * 0.97 && o.strike <= spot * 1.03)
+    };
+}
+
+// ─── Signal calculation logic ─────────────────────────────────────────────────
+
+function calculateSignal(spot, pcr, maxCEStrike, maxPEStrike) {
+    let trend = 'sideways';
+    let signal = 'WAIT';
+    let reason = [];
+
+    if (pcr < 0.7) {
+          trend = 'bearish';
+          reason.push('PCR ' + pcr + ' < 0.7 (bearish pressure)');
+    } else if (pcr > 1.3) {
+          trend = 'bullish';
+          reason.push('PCR ' + pcr + ' > 1.3 (bullish pressure)');
+    } else if (pcr > 1.1) {
+          trend = 'mildly_bullish';
+          reason.push('PCR ' + pcr + ' > 1.1 (mild bullish)');
+    } else if (pcr < 0.85) {
+          trend = 'mildly_bearish';
+          reason.push('PCR ' + pcr + ' < 0.85 (mild bearish)');
+    } else {
+          reason.push('PCR ' + pcr + ' neutral (0.85-1.1)');
+    }
+
+    const resistance = maxCEStrike;
+    const support = maxPEStrike;
+    reason.push('Max CE OI (Resistance): ' + resistance);
+    reason.push('Max PE OI (Support): ' + support);
+
+    if (trend === 'bullish' || trend === 'mildly_bullish') {
+          signal = 'BUY CE near ' + support;
+    } else if (trend === 'bearish' || trend === 'mildly_bearish') {
+          signal = 'BUY PE near ' + resistance;
+    } else {
+          signal = 'WAIT - Market sideways, sell straddle near ' + Math.round((support + resistance) / 2);
+    }
+
+    return { trend, signal, reason };
+}
+
+// ─── OAuth 2.0 endpoints ──────────────────────────────────────────────────────
+
+app.get('/', (req, res) => {
+    res.json({
+          service: 'dhun-mcp-server',
+          version: 'v8-nse',
+          status: 'live',
+          data_source: 'NSE India (Free, No Token)',
+          endpoints: [
+                  'GET /health',
+                  'GET /get_live_nifty',
+                  'GET /get_live_banknifty',
+                  'GET /get_option_chain?symbol=NIFTY',
+                  'GET /get_signal?symbol=NIFTY',
+                  'GET /.well-known/oauth-authorization-server',
+                  'POST /oauth/register',
+                  'GET /oauth/authorize',
+                  'POST /oauth/token',
+                  'GET /mcp'
+                ]
+    });
+});
+
+app.get('/health', (req, res) => {
+    res.json({ status: 'ok', ts: new Date().toISOString(), source: 'NSE India' });
+});
+
+// ─── Live Data Endpoints ──────────────────────────────────────────────────────
+
+app.get('/get_live_nifty', async (req, res) => {
+    try {
+          const data = await fetchNiftyOptionChain();
+          const processed = processOptionChain(data, 'NIFTY');
+          res.json({
+                  success: true,
+                  symbol: 'NIFTY',
+                  spot: processed.spot,
+                  pcr: processed.pcr,
+                  maxCEStrike: processed.maxCEStrike,
+                  maxPEStrike: processed.maxPEStrike,
+                  nearExpiry: processed.nearExpiry,
+                  source: 'NSE India',
+                  ts: new Date().toISOString()
+          });
+    } catch (e) {
+          console.error('[NIFTY ERROR]', e.message);
+          res.status(500).json({ success: false, error: e.message });
+    }
+});
+
+app.get('/get_live_banknifty', async (req, res) => {
+    try {
+          const data = await fetchBankNiftyOptionChain();
+          const processed = processOptionChain(data, 'BANKNIFTY');
+          res.json({
+                  success: true,
+                  symbol: 'BANKNIFTY',
+                  spot: processed.spot,
+                  pcr: processed.pcr,
+                  maxCEStrike: processed.maxCEStrike,
+                  maxPEStrike: processed.maxPEStrike,
+                  nearExpiry: processed.nearExpiry,
+                  source: 'NSE India',
+                  ts: new Date().toISOString()
+          });
+    } catch (e) {
+          console.error('[BANKNIFTY ERROR]', e.message);
+          res.status(500).json({ success: false, error: e.message });
+    }
+});
+
+app.get('/get_option_chain', async (req, res) => {
+    const symbol = (req.query.symbol || 'NIFTY').toUpperCase();
+    try {
+          let data;
+          if (symbol === 'BANKNIFTY') {
+                  data = await fetchBankNiftyOptionChain();
+          } else {
+                  data = await fetchNiftyOptionChain();
+          }
+          const processed = processOptionChain(data, symbol);
+          res.json({ success: true, ...processed, source: 'NSE India', ts: new Date().toISOString() });
+    } catch (e) {
+          console.error('[OPTCHAIN ERROR]', e.message);
+          res.status(500).json({ success: false, error: e.message });
+    }
+});
+
+app.get('/get_signal', async (req, res) => {
+    const symbol = (req.query.symbol || 'NIFTY').toUpperCase();
+    try {
+          let data;
+          if (symbol === 'BANKNIFTY') {
+                  data = await fetchBankNiftyOptionChain();
+          } else {
+                  data = await fetchNiftyOptionChain();
+          }
+          const processed = processOptionChain(data, symbol);
+          const signal = calculateSignal(processed.spot, processed.pcr, processed.maxCEStrike, processed.maxPEStrike);
+          res.json({
+                  success: true,
+                  symbol,
+                  spot: processed.spot,
+                  pcr: processed.pcr,
+                  ...signal,
+                  nearExpiry: processed.nearExpiry,
+                  source: 'NSE India',
+                  ts: new Date().toISOString()
+          });
+    } catch (e) {
+          console.error('[SIGNAL ERROR]', e.message);
+          res.status(500).json({ success: false, error: e.message });
+    }
+});
+
+// ─── OAuth 2.0 / MCP endpoints ───────────────────────────────────────────────
+
+app.get('/.well-known/oauth-authorization-server', (req, res) => {
+    res.json({
+          issuer: BASE_URL,
+          authorization_endpoint: BASE_URL + '/oauth/authorize',
+          token_endpoint: BASE_URL + '/oauth/token',
+          registration_endpoint: BASE_URL + '/oauth/register',
+          response_types_supported: ['code'],
+          grant_types_supported: ['authorization_code'],
+          code_challenge_methods_supported: ['S256']
+    });
+});
+
+app.post('/oauth/register', (req, res) => {
+    const clientId = 'client_' + crypto.randomBytes(8).toString('hex');
+    const clientSecret = 'secret_' + crypto.randomBytes(16).toString('hex');
+    registeredClients[clientId] = {
+          clientId,
+          clientSecret,
+          redirectUris: req.body.redirect_uris || [],
+          clientName: req.body.client_name || 'MCP Client'
+    };
+    res.status(201).json({
+          client_id: clientId,
+          client_secret: clientSecret,
+          client_name: req.body.client_name || 'MCP Client',
+          redirect_uris: req.body.redirect_uris || []
+    });
+});
+
+app.get('/oauth/authorize', (req, res) => {
+    const { client_id, redirect_uri, state, code_challenge, code_challenge_method } = req.query;
+    const code = 'code_' + crypto.randomBytes(16).toString('hex');
+    authCodes[code] = { client_id, redirect_uri, code_challenge, code_challenge_method, ts: Date.now() };
+    const redirectUrl = redirect_uri + '?code=' + code + (state ? '&state=' + state : '');
+    res.redirect(redirectUrl);
+});
+
+app.post('/oauth/token', express.urlencoded({ extended: true }), (req, res) => {
+    const { grant_type, code, redirect_uri, client_id, code_verifier } = req.body;
+    if (grant_type !== 'authorization_code') return res.status(400).json({ error: 'unsupported_grant_type' });
+    const authCode = authCodes[code];
+    if (!authCode) return res.status(400).json({ error: 'invalid_grant' });
+    delete authCodes[code];
+    const token = 'tok_' + crypto.randomBytes(32).toString('hex');
+    accessTokens[token] = { client_id, ts: Date.now() };
+    res.json({ access_token: token, token_type: 'bearer', expires_in: 86400 });
+});
+
+// ─── MCP endpoint ─────────────────────────────────────────────────────────────
+
+app.get('/mcp', (req, res) => {
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Connection', 'keep-alive');
+    res.write('data: ' + JSON.stringify({ type: 'connection', status: 'connected' }) + '\n\n');
+    const keepAlive = setInterval(() => res.write(': keepalive\n\n'), 25000);
+    req.on('close', () => clearInterval(keepAlive));
+});
+
+app.post('/mcp', async (req, res) => {
+    const body = req.body;
+    const method = body?.method;
+
+    if (method === 'initialize') {
+          return res.json({
+                  jsonrpc: '2.0', id: body.id,
+                  result: {
+                            protocolVersion: '2024-11-05',
+                            capabilities: { tools: {} },
+                            serverInfo: { name: 'dhun-mcp-server', version: 'v8-nse' }
+                  }
+          });
+    }
+
+    if (method === 'tools/list') {
+          return res.json({
+                  jsonrpc: '2.0', id: body.id,
+                  result: {
+                            tools: [
+                              {
+                                            name: 'get_live_nifty',
+                                            description: 'Get live NIFTY spot price, PCR, max OI strikes from NSE India',
+                                            inputSchema: { type: 'object', properties: {}, required: [] }
+                              },
+                              {
+                                            name: 'get_live_banknifty',
+                                            description: 'Get live BANKNIFTY spot price, PCR, max OI strikes from NSE India',
+                                            inputSchema: { type: 'object', properties: {}, required: [] }
+                              },
+                              {
+                                            name: 'get_option_chain',
+                                            description: 'Get full option chain data for NIFTY or BANKNIFTY',
+                                            inputSchema: {
+                                                            type: 'object',
+                                                            properties: { symbol: { type: 'string', description: 'NIFTY or BANKNIFTY', default: 'NIFTY' } },
+                                                            required: []
+                                            }
+                              },
+                              {
+                                            name: 'get_signal',
+                                            description: 'Get trading signal based on PCR and OI analysis',
+                                            inputSchema: {
+                                                            type: 'object',
+                                                            properties: { symbol: { type: 'string', description: 'NIFTY or BANKNIFTY', default: 'NIFTY' } },
+                                                            required: []
+                                            }
+                              }
+                                      ]
+                  }
+          });
+    }
+
+    if (method === 'tools/call') {
+          const toolName = body?.params?.name;
+          const toolArgs = body?.params?.arguments || {};
+
+          try {
+                  let result;
+
+                  if (toolName === 'get_live_nifty') {
+                            const data = await fetchNiftyOptionChain();
+                            const processed = processOptionChain(data, 'NIFTY');
+                            result = { spot: processed.spot, pcr: processed.pcr, maxCEStrike: processed.maxCEStrike, maxPEStrike: processed.maxPEStrike, nearExpiry: processed.nearExpiry, source: 'NSE India' };
+                  } else if (toolName === 'get_live_banknifty') {
+                            const data = await fetchBankNiftyOptionChain();
+                            const processed = processOptionChain(data, 'BANKNIFTY');
+                            result = { spot: processed.spot, pcr: processed.pcr, maxCEStrike: processed.maxCEStrike, maxPEStrike: processed.maxPEStrike, nearExpiry: processed.nearExpiry, source: 'NSE India' };
+                  } else if (toolName === 'get_option_chain') {
+                            const sym = (toolArgs.symbol || 'NIFTY').toUpperCase();
+                            const data = sym === 'BANKNIFTY' ? await fetchBankNiftyOptionChain() : await fetchNiftyOptionChain();
+                            result = processOptionChain(data, sym);
+                  } else if (toolName === 'get_signal') {
+                            const sym = (toolArgs.symbol || 'NIFTY').toUpperCase();
+                            const data = sym === 'BANKNIFTY' ? await fetchBankNiftyOptionChain() : await fetchNiftyOptionChain();
+                            const processed = processOptionChain(data, sym);
+                            const sig = calculateSignal(processed.spot, processed.pcr, processed.maxCEStrike, processed.maxPEStrike);
+                            result = { symbol: sym, spot: processed.spot, pcr: processed.pcr, ...sig, nearExpiry: processed.nearExpiry };
+                  } else {
+                            return res.json({ jsonrpc: '2.0', id: body.id, error: { code: -32601, message: 'Tool not found: ' + toolName } });
+                  }
+
+                  return res.json({
+                            jsonrpc: '2.0', id: body.id,
+                            result: { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] }
+                  });
+
+          } catch (e) {
+                  return res.json({ jsonrpc: '2.0', id: body.id, error: { code: -32000, message: e.message } });
+          }
+    }
+
+    res.json({ jsonrpc: '2.0', id: body.id, error: { code: -32601, message: 'Method not found' } });
+});
+
+// ─── Start server ─────────────────────────────────────────────────────────────
+
+app.listen(PORT, () => {
+    console.log('[START] dhun-mcp-server v8-nse on port', PORT);
+    console.log('[START] Data source: NSE India (Free, No Token Required)');
+    console.log('[START] Endpoints: /get_live_nifty, /get_live_banknifty, /get_option_chain, /get_signal');
+});
 
 // Global request logger
 app.use((req, res, next) => {
